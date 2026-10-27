@@ -1,0 +1,874 @@
+"""Comunicação com a impressora Epson (ESC/POS) e utilitários de valores."""
+
+import re
+import threading
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+import pywintypes
+import win32print
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+NOME_IMPRESSORA = "EPSON TM-T20X Receipt6"
+COLUNAS = 48  # colunas da fonte normal em papel de 80 mm (32 para 58 mm)
+
+TITULO_BANHO = "Banho de 7 minutos"
+
+# ============================================================
+# COMANDOS ESC/POS
+# ============================================================
+
+INICIALIZAR = b"\x1b\x40"
+CODEPAGE_850 = b"\x1b\x74\x02"      # acentos compatíveis com cp850
+ALINHAR_CENTRO = b"\x1b\x61\x01"
+ALINHAR_DIREITA = b"\x1b\x61\x02"
+FONTE_NORMAL = b"\x1d\x21\x00"
+CORTAR = b"\x1d\x56\x00"
+
+
+def fonte(tamanho):
+    """Comando de tamanho de fonte (nibble alto = largura, baixo = altura)."""
+    return bytes([0x1D, 0x21, tamanho])
+
+
+def avancar(linhas):
+    return b"\n" * linhas
+
+
+def _codificar(texto):
+    # errors="replace": um caractere fora do cp850 vira "?" em vez de travar
+    return texto.encode("cp850", errors="replace")
+
+
+QR_CORRECAO_L = 0x30
+QR_CORRECAO_M = 0x31
+QR_CORRECAO_Q = 0x32
+QR_CORRECAO_H = 0x33
+
+
+def _gs_k(funcao, parametros=b""):
+    """Comando GS ( k de QR Code: cn=0x31, fn=funcao, seguido dos parâmetros."""
+    tamanho = len(parametros) + 2
+    return bytes([0x1D, 0x28, 0x6B, tamanho % 256, tamanho // 256, 0x31, funcao]) + parametros
+
+
+def comando_qrcode(conteudo, modulo=8, correcao=QR_CORRECAO_M):
+    """Bytes que configuram, armazenam e imprimem um QR Code.
+
+    modulo: tamanho de cada quadradinho (1 a 16).
+    """
+    if not 1 <= modulo <= 16:
+        raise ValueError("modulo deve estar entre 1 e 16")
+
+    return b"".join([
+        _gs_k(0x43, bytes([modulo])),             # tamanho
+        _gs_k(0x45, bytes([correcao])),           # correção de erro
+        _gs_k(0x50, b"\x30" + conteudo.encode("utf-8")),  # armazena dados
+        _gs_k(0x51, b"\x30"),                     # imprime
+    ])
+
+
+def montar_qr_wifi(rede, senha):
+    """Texto do QR no padrão WIFI:T:WPA;S:rede;P:senha;;
+
+    Caracteres especiais (\\ ; , : ") são escapados. Senha vazia = rede aberta.
+    """
+    def esc(texto):
+        return re.sub(r'([\\;,:"])', r"\\\1", texto)
+
+    if senha:
+        return f"WIFI:T:WPA;S:{esc(rede)};P:{esc(senha)};;"
+    return f"WIFI:T:nopass;S:{esc(rede)};;"
+
+
+# ============================================================
+# VALORES (Decimal evita erro de arredondamento do float)
+# ============================================================
+
+CENTAVOS = Decimal("0.01")
+VALOR_MAXIMO = Decimal("99999999.99")
+
+
+def parse_valor(texto):
+    """Converte texto em Decimal com 2 casas.
+
+    Aceita "10", "10.50", "10,50" e "1.234,56" (se houver vírgula,
+    o ponto é tratado como separador de milhar).
+    Levanta ValueError se o texto não for um valor válido.
+    """
+    limpo = texto.strip().replace("R$", "").replace(" ", "")
+
+    if not re.fullmatch(r"-?[\d.,]+", limpo):
+        raise ValueError(f"valor inválido: {texto!r}")
+
+    if "," in limpo:
+        limpo = limpo.replace(".", "").replace(",", ".")
+
+    try:
+        valor = Decimal(limpo)
+    except InvalidOperation:
+        raise ValueError(f"valor inválido: {texto!r}") from None
+
+    if abs(valor) > VALOR_MAXIMO:
+        raise ValueError(f"valor muito alto: {texto!r}")
+
+    return valor.quantize(CENTAVOS, rounding=ROUND_HALF_UP)
+
+
+def formatar_valor(valor):
+    """Formata para exibição.
+
+    1       -> 1,00
+    3000    -> 3 000,00
+    8278.25 -> 8 278,25
+    """
+    return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+
+
+# ============================================================
+# IMPRESSORA
+# ============================================================
+
+class ErroImpressora(Exception):
+    """Falha de comunicação com a impressora (mensagem pronta para o usuário)."""
+
+
+class Impressora:
+
+    def __init__(self, nome=NOME_IMPRESSORA):
+        self.nome = nome
+        self._trava = threading.Lock()   # um trabalho por vez no spooler
+
+        self.tamanhos = {
+            "Normal": 0x00,
+            "Média (2x2)": 0x11,
+            "Grande (3x3)": 0x22,
+            "Muito Grande (4x4)": 0x33,
+            "Gigante (8x8)": 0x77,
+        }
+
+    # --------------------------------------------------------
+    # Envio (único lugar que fala com o spooler)
+    # --------------------------------------------------------
+
+    def _enviar(self, nome_doc, dados):
+        with self._trava:
+            try:
+                h = win32print.OpenPrinter(self.nome)
+                try:
+                    win32print.StartDocPrinter(h, 1, (nome_doc, None, "RAW"))
+                    win32print.StartPagePrinter(h)
+                    win32print.WritePrinter(h, bytes(dados))
+                    win32print.EndPagePrinter(h)
+                    win32print.EndDocPrinter(h)
+                finally:
+                    win32print.ClosePrinter(h)
+            except pywintypes.error as erro:
+                raise ErroImpressora(
+                    f"Não foi possível imprimir em '{self.nome}'.\n"
+                    "Verifique se a impressora está ligada, com papel "
+                    "e conectada ao computador.\n\n"
+                    f"Detalhe: {erro.strerror}"
+                ) from erro
+
+    @staticmethod
+    def _iniciar():
+        return INICIALIZAR + CODEPAGE_850
+
+    # --------------------------------------------------------
+    # Documentos
+    # --------------------------------------------------------
+
+    def imprimir(self, texto, tamanho):
+        dados = b"".join([
+            self._iniciar(),
+            ALINHAR_CENTRO,
+            fonte(tamanho),
+            _codificar(texto),
+            FONTE_NORMAL,
+            avancar(6),
+            CORTAR,
+        ])
+        self._enviar("Texto", dados)
+
+    def imprimir_banho(self, senha, tamanho):
+        dados = b"".join([
+            self._iniciar(),
+            ALINHAR_CENTRO,
+            fonte(0x11),
+            _codificar(TITULO_BANHO),
+            avancar(2),
+            fonte(tamanho),
+            _codificar(senha),
+            FONTE_NORMAL,
+            avancar(6),
+            CORTAR,
+        ])
+        self._enviar("Senha", dados)
+
+    def vale_imp(self, valor):
+        data = datetime.now().strftime("%d/%m/%Y")
+        separador = "=" * 32
+
+        dados = b"".join([
+            self._iniciar(),
+            ALINHAR_CENTRO,
+            fonte(0x11),
+            _codificar("POSTO 44\n"),
+            FONTE_NORMAL,
+            _codificar(f"{separador}\nData: {data}\n\n"),
+            fonte(0x22),
+            _codificar("VALE\n"),
+            _codificar(f"R$ {formatar_valor(valor)}\n\n"),
+            FONTE_NORMAL,
+            _codificar(
+                f"{separador}\n\n"
+                "Autorizado por:\n\n"
+                f"{'_' * 30}\n\n"
+                "Valido somente no Posto 44\n"
+            ),
+            avancar(4),
+            CORTAR,
+        ])
+        self._enviar("Vale Combustivel", dados)
+
+    def imprimir_calculo(self, valores, total):
+        """Fita de soma: valores à direita, linha, total."""
+        linhas = [
+            f"{formatar_valor(abs(v))} {'-' if v < 0 else '+'}"
+            for v in valores
+        ]
+        texto_total = formatar_valor(total)
+
+        # fonte 2x2 = metade das colunas
+        largura = min(
+            max(len(x) for x in [*linhas, texto_total]),
+            COLUNAS // 2,
+        )
+
+        dados = b"".join([
+            self._iniciar(),
+            ALINHAR_DIREITA,
+            fonte(0x11),
+            _codificar("\n".join(linhas) + "\n"),
+            _codificar("-" * largura + "\n"),
+            _codificar(texto_total + "\n"),
+            FONTE_NORMAL,
+            avancar(3),
+            CORTAR,
+        ])
+        self._enviar("Calculadora", dados)
+
+    def imprimir_wifi(self, rede, senha, titulo="WIFI"):
+        """Imprime título, nome da rede, senha e o QR Code de conexão."""
+        linhas = [titulo, rede]
+        if senha:
+            linhas.append(f"Senha: {senha}")
+
+        dados = b"".join([
+            self._iniciar(),
+            ALINHAR_CENTRO,
+            fonte(0x11),
+            _codificar("\n".join(linhas) + "\n\n"),
+            FONTE_NORMAL,
+            comando_qrcode(montar_qr_wifi(rede, senha)),
+            avancar(4),
+            CORTAR,
+        ])
+        self._enviar("QR Code WiFi", dados)
+
+
+
+
+
+###### tela 
+
+"""Interface gráfica (Tkinter) do sistema de impressão."""
+
+import csv
+import logging
+import queue
+import secrets
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+from main import Impressora, formatar_valor, parse_valor
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent   # independe de onde o atalho abre
+PASTA_CSV = BASE_DIR / "CSV"
+LOG_VALES = BASE_DIR / "logs" / "vales.csv"
+
+MAX_SENHAS = 500
+MAX_COPIAS_WIFI = 20
+
+WIFI_REDE_PADRAO = "Clientes Posto 44"
+WIFI_SENHA_PADRAO = "posto442025"
+PAUSA_ENTRE_IMPRESSOES = 0.3
+
+COR_FUNDO = "#242424"
+COR_ABA = "#323232"
+COR_CABECALHO = "#C51F26"
+COR_BOTAO = "#28a745"
+COR_BOTAO_OCUPADO = "#6c757d"
+
+STATUS = {
+    "ok": ("🟢", "#00FF66"),
+    "ocupado": ("🟡", "#FFC107"),
+    "erro": ("🔴", "#FF5555"),
+}
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES (sem interface)
+# ============================================================
+
+def gerar_senhas(quantidade):
+    """Senhas únicas de 6 dígitos (sem zero à esquerda), geradas com `secrets`."""
+    sorteio = secrets.SystemRandom()
+    return [str(n) for n in sorteio.sample(range(100000, 1000000), quantidade)]
+
+
+def salvar_csv_senhas(senhas):
+    PASTA_CSV.mkdir(parents=True, exist_ok=True)
+    arquivo = PASTA_CSV / f"senhas_{datetime.now():%d-%m-%Y_%H-%M-%S}.csv"
+
+    with open(arquivo, "w", newline="", encoding="utf-8-sig") as f:
+        escritor = csv.writer(f, delimiter=";")
+        escritor.writerow(["Nº", "Senha"])
+        escritor.writerows(enumerate(senhas, start=1))
+
+    return arquivo
+
+
+def registrar_vale(valor):
+    """Guarda cada vale impresso (auditoria). Falha aqui não impede a impressão."""
+    try:
+        LOG_VALES.parent.mkdir(parents=True, exist_ok=True)
+        novo = not LOG_VALES.exists()
+
+        with open(LOG_VALES, "a", newline="", encoding="utf-8") as f:
+            escritor = csv.writer(f, delimiter=";")
+            if novo:
+                escritor.writerow(["Data/Hora", "Valor"])
+            escritor.writerow([
+                datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                f"{valor:.2f}".replace(".", ","),
+            ])
+    except OSError:
+        logging.warning("Não foi possível registrar o vale no log", exc_info=True)
+
+
+# ============================================================
+# TELA
+# ============================================================
+
+class Tela:
+
+    def __init__(self):
+        self.imp = Impressora()
+        self.janela = tk.Tk()
+
+        self.fonte_var = tk.StringVar(value="Média (2x2)")
+        self.cabecalho_var = tk.StringVar(value="")
+
+        self.fila = queue.Queue()     # worker -> interface
+        self.botoes = []
+        self.ocupado = False
+        self._avanco = None
+        self._detalhe_falha = ""
+
+        self._configurar_janela()
+        self._criar_cabecalho()
+        self._criar_status()          # antes das abas: nunca fica cortado
+        self._criar_abas()
+
+        self.janela.report_callback_exception = self._erro_inesperado
+        self.janela.protocol("WM_DELETE_WINDOW", self._fechar)
+        self.janela.after(100, self._processar_fila)
+
+    def executar(self):
+        self.janela.mainloop()
+
+    # --------------------------------------------------------
+    # Janela
+    # --------------------------------------------------------
+
+    def _configurar_janela(self):
+        self.janela.title("Sistema de Impressão")
+
+        largura, altura = 800, 650
+        pos_x = (self.janela.winfo_screenwidth() - largura) // 2
+        pos_y = (self.janela.winfo_screenheight() - altura) // 2
+
+        self.janela.geometry(f"{largura}x{altura}+{pos_x}+{pos_y}")
+        self.janela.resizable(False, False)
+        self.janela.configure(bg=COR_FUNDO)
+
+    def _configurar_estilo(self):
+        estilo = ttk.Style()
+        estilo.theme_use("clam")
+
+        estilo.configure("TNotebook", background="#2b2b2b", borderwidth=0)
+        estilo.configure(
+            "TNotebook.Tab",
+            background="#3a3a3a",
+            foreground="white",
+            padding=(15, 5),
+            font=("Segoe UI", 10, "bold"),
+        )
+        estilo.map(
+            "TNotebook.Tab",
+            background=[("selected", "#d71920")],
+            foreground=[("selected", "white")],
+        )
+
+    def _criar_cabecalho(self):
+        cabecalho = tk.Frame(self.janela, bg=COR_CABECALHO)
+        cabecalho.pack(fill="x")
+
+        tk.Label(
+            cabecalho,
+            textvariable=self.cabecalho_var,
+            bg=COR_CABECALHO,
+            fg="white",
+            font=("Arial", 24, "bold"),
+        ).pack(pady=(10, 0))
+
+        tk.Label(
+            cabecalho,
+            text="Sistema de Impressão",
+            bg=COR_CABECALHO,
+            fg="white",
+            font=("Arial", 12),
+        ).pack()
+
+        controles = tk.Frame(cabecalho, bg=COR_CABECALHO)
+        controles.pack(pady=10)
+
+        tk.Label(controles, text="Cabeçalho:", bg=COR_CABECALHO, fg="white") \
+            .grid(row=0, column=0, padx=5)
+
+        tk.Entry(controles, textvariable=self.cabecalho_var, width=25) \
+            .grid(row=0, column=1, padx=5)
+
+        tk.Label(controles, text="Fonte:", bg=COR_CABECALHO, fg="white") \
+            .grid(row=0, column=2, padx=5)
+
+        ttk.Combobox(
+            controles,
+            textvariable=self.fonte_var,
+            values=list(self.imp.tamanhos),
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=3, padx=5)
+
+    def _criar_status(self):
+        self.status = tk.Label(
+            self.janela, text="", bg="#1F1F1F", anchor="w", padx=10
+        )
+        self.status.pack(fill="x", side="bottom")
+        self._status("Sistema pronto.")
+
+    def _status(self, texto, tipo="ok"):
+        icone, cor = STATUS[tipo]
+        self.status.config(text=f"{icone} {texto}", fg=cor)
+
+    # --------------------------------------------------------
+    # Abas
+    # --------------------------------------------------------
+
+    def _criar_abas(self):
+        self._configurar_estilo()
+
+        self.notebook = ttk.Notebook(self.janela)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._montar_aba_texto()
+        self._montar_aba_banho()
+        self._montar_aba_vale()
+        self._montar_aba_calculadora()
+        self._montar_aba_wifi()
+
+    def _nova_aba(self, titulo):
+        aba = tk.Frame(self.notebook, bg=COR_ABA)
+        self.notebook.add(aba, text=titulo)
+        return aba
+
+    def _criar_dica(self, pai, texto):
+        tk.Label(pai, text=texto, bg=COR_ABA, fg="#bbbbbb", font=("Arial", 9)) \
+            .pack(pady=(12, 3))
+
+    def _criar_caixa(self, pai, largura, altura):
+        caixa = tk.Text(pai, font=("Arial", 10, "bold"), width=largura, height=altura)
+        caixa.pack(pady=(0, 8))
+        return caixa
+
+    def _criar_botao(self, pai, texto, comando):
+        botao = tk.Button(
+            pai,
+            text=texto,
+            font=("Arial", 14, "bold"),
+            bg=COR_BOTAO,
+            fg="white",
+            activebackground="#218838",
+            activeforeground="white",
+            disabledforeground="#dddddd",
+            width=22,
+            height=2,
+            relief="flat",
+            cursor="hand2",
+            command=comando,
+        )
+        botao.pack(pady=12)
+        self.botoes.append(botao)
+        return botao
+
+    def _montar_aba_texto(self):
+        aba = self._nova_aba("Texto")
+        self._criar_dica(aba, "Uma impressão por linha (o cabeçalho vai acima de cada uma).")
+        self.caixa_texto = self._criar_caixa(aba, 50, 12)
+        self._criar_botao(aba, "🖨 IMPRIMIR", self.imprimir_texto)
+
+    def _montar_aba_banho(self):
+        aba = self._nova_aba("Banho")
+        self._criar_dica(aba, f"Quantidade de senhas (1 a {MAX_SENHAS}). "
+                              "Os códigos também são salvos na pasta CSV.")
+        self.entrada_banho = tk.Entry(
+            aba, font=("Arial", 16, "bold"), width=8, justify="center"
+        )
+        self.entrada_banho.pack(pady=(0, 10))
+        self.entrada_banho.bind("<Return>", lambda _e: self.imprimir_banho())
+        self._criar_botao(aba, "🖨 IMPRIMIR", self.imprimir_banho)
+
+    def _montar_aba_vale(self):
+        aba = self._nova_aba("Vale")
+        self._criar_dica(aba, "Um valor por linha (um vale para cada linha).")
+        self.caixa_vale = self._criar_caixa(aba, 60, 12)
+        self._criar_botao(aba, "🖨 IMPRIMIR", self.imprimir_vale)
+
+    def _montar_aba_calculadora(self):
+        aba = self._nova_aba("Calculadora")
+        self._criar_dica(aba, "Um valor por linha. Use sinal de menos para subtrair.")
+        self.caixa_calculadora = self._criar_caixa(aba, 50, 8)
+
+        self.resultado_calculadora = tk.Label(
+            aba,
+            text="Total: 0,00",
+            bg=COR_ABA,
+            fg="white",
+            font=("Arial", 20, "bold"),
+        )
+        self.resultado_calculadora.pack(pady=8)
+
+        self._criar_botao(aba, "CALCULAR E IMPRIMIR", self.calcular)
+
+    def _montar_aba_wifi(self):
+        aba = self._nova_aba("WiFi")
+        self._criar_dica(aba, "Imprime o nome da rede, a senha e o QR Code de conexão.")
+
+        campos = tk.Frame(aba, bg=COR_ABA)
+        campos.pack(pady=10)
+
+        def campo(linha, rotulo, valor, largura=30):
+            tk.Label(campos, text=rotulo, bg=COR_ABA, fg="white", font=("Arial", 11)) \
+                .grid(row=linha, column=0, sticky="e", padx=8, pady=6)
+            entrada = tk.Entry(campos, font=("Arial", 12), width=largura)
+            entrada.insert(0, valor)
+            entrada.grid(row=linha, column=1, sticky="w", padx=8, pady=6)
+            return entrada
+
+        self.entrada_wifi_titulo = campo(0, "Título:", "WIFI")
+        self.entrada_wifi_rede = campo(1, "Rede:", WIFI_REDE_PADRAO)
+        self.entrada_wifi_senha = campo(2, "Senha:", WIFI_SENHA_PADRAO)
+        self.entrada_wifi_copias = campo(3, "Cópias:", "1", largura=6)
+
+        self._criar_botao(aba, "🖨 IMPRIMIR", self.imprimir_wifi)
+
+    # --------------------------------------------------------
+    # Execução em segundo plano (a janela não congela)
+    # --------------------------------------------------------
+
+    def _executar(self, tarefa, ao_concluir):
+        """Roda `tarefa(progresso)` numa thread e chama `ao_concluir(resultado)`."""
+        self._avanco = None
+        self._detalhe_falha = ""
+        self._definir_ocupado(True)
+        self._status("Imprimindo...", "ocupado")
+
+        def trabalho():
+            try:
+                resultado = tarefa(self._registrar_avanco)
+            except Exception as erro:
+                self.fila.put(lambda e=erro: self._falha(e))
+            else:
+                self.fila.put(lambda r=resultado: self._sucesso(ao_concluir, r))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _registrar_avanco(self, atual, total):
+        # chamado pela thread de trabalho
+        self._avanco = (atual, total)
+        self.fila.put(
+            lambda: self._status(f"Imprimindo {atual} de {total}...", "ocupado")
+        )
+
+    def _processar_fila(self):
+        try:
+            while True:
+                self.fila.get_nowait()()
+        except queue.Empty:
+            pass
+        finally:
+            self.janela.after(100, self._processar_fila)
+
+    def _definir_ocupado(self, ocupado):
+        self.ocupado = ocupado
+        for botao in self.botoes:
+            botao.config(
+                state="disabled" if ocupado else "normal",
+                bg=COR_BOTAO_OCUPADO if ocupado else COR_BOTAO,
+            )
+
+    def _sucesso(self, ao_concluir, resultado):
+        self._definir_ocupado(False)
+        ao_concluir(resultado)
+
+    def _falha(self, erro):
+        self._definir_ocupado(False)
+        logging.error("Falha na impressão", exc_info=erro)
+
+        mensagem = str(erro)
+        detalhe = self._detalhe_falha
+        if not detalhe and self._avanco:
+            atual, total = self._avanco
+            detalhe = f"Impressos antes do erro: {atual} de {total}."
+        if detalhe:
+            mensagem += f"\n\n{detalhe}"
+
+        self._status("Falha na impressão.", "erro")
+        messagebox.showerror("Erro", mensagem)
+
+    def _erro_inesperado(self, tipo, valor, tb):
+        logging.error("Erro inesperado na interface", exc_info=(tipo, valor, tb))
+        self._definir_ocupado(False)
+        self._status("Erro inesperado (veja erros.log).", "erro")
+        messagebox.showerror("Erro", f"Erro inesperado:\n{valor}")
+
+    def _fechar(self):
+        if self.ocupado and not messagebox.askyesno(
+            "Impressão em andamento",
+            "Ainda há uma impressão em andamento.\nFechar mesmo assim?",
+        ):
+            return
+        self.janela.destroy()
+
+    # --------------------------------------------------------
+    # Leitura de campos
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _ler_valores(caixa, permitir_negativo):
+        """Lê um valor por linha. Valida tudo ANTES de imprimir qualquer coisa."""
+        valores = []
+
+        for numero, linha in enumerate(caixa.get("1.0", tk.END).splitlines(), start=1):
+            linha = linha.strip()
+            if not linha:
+                continue
+
+            try:
+                valor = parse_valor(linha)
+            except ValueError:
+                raise ValueError(f"Linha {numero}: valor inválido ({linha}).") from None
+
+            if not permitir_negativo and valor <= 0:
+                raise ValueError(f"Linha {numero}: o valor deve ser maior que zero.")
+
+            valores.append(valor)
+
+        if not valores:
+            raise ValueError("Digite pelo menos um valor.")
+
+        return valores
+
+    # --------------------------------------------------------
+    # Ações
+    # --------------------------------------------------------
+
+    def imprimir_texto(self):
+        if self.ocupado:
+            return
+
+        linhas = [x.strip() for x in self.caixa_texto.get("1.0", tk.END).splitlines()]
+        linhas = [x for x in linhas if x]
+
+        if not linhas:
+            messagebox.showwarning("Aviso", "Digite pelo menos um texto.")
+            return
+
+        tamanho = self.imp.tamanhos[self.fonte_var.get()]
+        cabecalho = self.cabecalho_var.get().strip()
+        textos = [f"{cabecalho}\n{x}" if cabecalho else x for x in linhas]
+
+        def tarefa(progresso):
+            for i, texto in enumerate(textos, start=1):
+                self.imp.imprimir(texto, tamanho)
+                progresso(i, len(textos))
+                time.sleep(PAUSA_ENTRE_IMPRESSOES)
+            return len(textos)
+
+        def concluido(qtd):
+            self.caixa_texto.delete("1.0", tk.END)
+            self._status(f"{qtd} impressão(ões) concluída(s).")
+
+        self._executar(tarefa, concluido)
+
+    def imprimir_banho(self):
+        if self.ocupado:
+            return
+
+        texto = self.entrada_banho.get().strip()
+
+        if not texto.isdecimal() or not 1 <= int(texto) <= MAX_SENHAS:
+            messagebox.showwarning(
+                "Aviso", f"Digite uma quantidade de 1 a {MAX_SENHAS}."
+            )
+            return
+
+        quantidade = int(texto)
+
+        if not messagebox.askyesno(
+            "Confirmar", f"Gerar e imprimir {quantidade} senha(s)?"
+        ):
+            return
+
+        senhas = gerar_senhas(quantidade)
+        tamanho = self.imp.tamanhos[self.fonte_var.get()]
+
+        def tarefa(progresso):
+            impressas = []
+            try:
+                for senha in senhas:
+                    self.imp.imprimir_banho(senha, tamanho)
+                    impressas.append(senha)
+                    progresso(len(impressas), len(senhas))
+                    time.sleep(PAUSA_ENTRE_IMPRESSOES)
+            finally:
+                # o CSV guarda exatamente o que saiu impresso, mesmo se falhar no meio
+                if impressas:
+                    arquivo = salvar_csv_senhas(impressas)
+                    self._detalhe_falha = (
+                        f"{len(impressas)} de {len(senhas)} senhas foram impressas "
+                        f"e salvas em:\n{arquivo}"
+                    )
+            return arquivo, len(impressas)
+
+        def concluido(resultado):
+            arquivo, qtd = resultado
+            self.entrada_banho.delete(0, tk.END)
+            self._status(f"{qtd} senhas criadas e impressas.")
+            messagebox.showinfo(
+                "Concluído", f"{qtd} senhas geradas.\nArquivo: {arquivo}"
+            )
+
+        self._executar(tarefa, concluido)
+
+    def imprimir_vale(self):
+        if self.ocupado:
+            return
+
+        try:
+            valores = self._ler_valores(self.caixa_vale, permitir_negativo=False)
+        except ValueError as erro:
+            messagebox.showwarning("Aviso", str(erro))
+            return
+
+        total = formatar_valor(sum(valores, Decimal("0")))
+
+        if not messagebox.askyesno(
+            "Confirmar",
+            f"Imprimir {len(valores)} vale(s), total R$ {total}?",
+        ):
+            return
+
+        def tarefa(progresso):
+            for i, valor in enumerate(valores, start=1):
+                self.imp.vale_imp(valor)
+                registrar_vale(valor)
+                progresso(i, len(valores))
+                time.sleep(PAUSA_ENTRE_IMPRESSOES)
+            return len(valores)
+
+        def concluido(qtd):
+            self.caixa_vale.delete("1.0", tk.END)
+            self._status(f"{qtd} vale(s) impresso(s).")
+
+        self._executar(tarefa, concluido)
+
+    def calcular(self):
+        if self.ocupado:
+            return
+
+        try:
+            valores = self._ler_valores(self.caixa_calculadora, permitir_negativo=True)
+        except ValueError as erro:
+            messagebox.showwarning("Aviso", str(erro))
+            return
+
+        total = sum(valores, Decimal("0"))
+        texto_total = formatar_valor(total)
+        self.resultado_calculadora.config(text=f"Total: {texto_total}")
+
+        def tarefa(progresso):
+            self.imp.imprimir_calculo(valores, total)
+
+        def concluido(_resultado):
+            self.caixa_calculadora.delete("1.0", tk.END)
+            self._status(f"Calculadora: total = {texto_total}")
+
+        self._executar(tarefa, concluido)
+
+    def imprimir_wifi(self):
+        if self.ocupado:
+            return
+
+        titulo = self.entrada_wifi_titulo.get().strip() or "WIFI"
+        rede = self.entrada_wifi_rede.get().strip()
+        senha = self.entrada_wifi_senha.get().strip()
+        copias = self.entrada_wifi_copias.get().strip()
+
+        if not rede:
+            messagebox.showwarning("Aviso", "Digite o nome da rede.")
+            return
+
+        if not copias.isdecimal() or not 1 <= int(copias) <= MAX_COPIAS_WIFI:
+            messagebox.showwarning(
+                "Aviso", f"Digite um número de cópias de 1 a {MAX_COPIAS_WIFI}."
+            )
+            return
+
+        copias = int(copias)
+
+        def tarefa(progresso):
+            for i in range(1, copias + 1):
+                self.imp.imprimir_wifi(rede, senha, titulo)
+                progresso(i, copias)
+                time.sleep(PAUSA_ENTRE_IMPRESSOES)
+            return copias
+
+        def concluido(qtd):
+            self._status(f"{qtd} QR Code(s) de WiFi impresso(s).")
+
+        self._executar(tarefa, concluido)

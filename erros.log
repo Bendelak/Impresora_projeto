@@ -1,0 +1,30 @@
+2026-10-16 13:45:49,513 ERROR Falha ao iniciar o sistema
+Traceback (most recent call last):
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\app.pyw", line 22, in main
+    from tela import Tela   # dentro do try: pega também erro de import (ex.: pywin32)
+    ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\tela.py", line 20, in <module>
+    from main import (
+    ...<8 lines>...
+    )
+ImportError: cannot import name 'listar_impressoras' from 'main' (C:\Users\Administrador\Desktop\Imprimir Textos EPSON\main.py)
+2026-10-16 13:45:54,266 ERROR Falha ao iniciar o sistema
+Traceback (most recent call last):
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\app.pyw", line 22, in main
+    from tela import Tela   # dentro do try: pega também erro de import (ex.: pywin32)
+    ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\tela.py", line 20, in <module>
+    from main import (
+    ...<8 lines>...
+    )
+ImportError: cannot import name 'listar_impressoras' from 'main' (C:\Users\Administrador\Desktop\Imprimir Textos EPSON\main.py)
+2026-10-16 13:49:38,877 ERROR Falha ao iniciar o sistema
+Traceback (most recent call last):
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\app.pyw", line 22, in main
+    from tela import Tela   # dentro do try: pega também erro de import (ex.: pywin32)
+    ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrador\Desktop\Imprimir Textos EPSON\tela.py", line 20, in <module>
+    from main import (
+    ...<8 lines>...
+    )
+ImportError: cannot import name 'listar_impressoras' from 'main' (C:\Users\Administrador\Desktop\Imprimir Textos EPSON\main.py)
